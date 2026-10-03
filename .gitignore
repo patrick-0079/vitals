@@ -6,6 +6,10 @@
 # 只读参考源码（LibreHardwareMonitor 等），不参与构建、不入库
 /.ref/
 
+# Python（web 壳）
+__pycache__/
+*.pyc
+
 # 编辑器 / 系统
 .vscode/
 .idea/

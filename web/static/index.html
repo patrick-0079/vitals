@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vitals · 实时硬件监控</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">◧ vitals <span class="ver" id="version">…</span></div>
+  <div class="machine" id="machine">正在读取硬件信息…</div>
+  <div class="controls">
+    <label class="ctl">刷新
+      <select id="interval">
+        <option value="0.25">4 Hz</option>
+        <option value="0.5" selected>2 Hz</option>
+        <option value="1">1 Hz</option>
+        <option value="2">0.5 Hz</option>
+      </select>
+    </label>
+    <span class="conn"><span class="dot" id="conn"></span><span id="conn-text">连接中…</span></span>
+    <span class="ts" id="ts">—</span>
+  </div>
+</header>
+
+<div class="banner hidden" id="banner"></div>
+
+<main id="dash">
+
+  <section class="card wide" id="card-cpu">
+    <h2>CPU <small id="cpu-source"></small></h2>
+    <div class="gauges">
+      <div class="gauge">
+        <div class="gauge-label">占用率</div>
+        <div class="gauge-value" id="cpu-usage">—</div>
+        <div class="bar"><div class="fill" id="cpu-usage-bar"></div></div>
+      </div>
+      <div class="gauge">
+        <div class="gauge-label">温度</div>
+        <div class="gauge-value" id="cpu-temp">—</div>
+        <div class="gauge-sub" id="cpu-ccd"></div>
+      </div>
+      <div class="gauge">
+        <div class="gauge-label">频率</div>
+        <div class="gauge-value" id="cpu-freq">—</div>
+        <div class="gauge-sub" id="cpu-cores-count"></div>
+      </div>
+      <div class="gauge">
+        <div class="gauge-label">整包功耗</div>
+        <div class="gauge-value" id="cpu-power">—</div>
+        <div class="gauge-sub" id="cpu-volt"></div>
+      </div>
+    </div>
+    <div class="subhead">每逻辑核心占用</div>
+    <div class="coregrid" id="cpu-coregrid"></div>
+    <div class="subhead" id="percore-head">每物理核（MSR）</div>
+    <div class="percore" id="cpu-percore"></div>
+    <div class="subhead" id="smu-head">SMU 传感器</div>
+    <div class="chips" id="cpu-smu"></div>
+  </section>
+
+  <section class="card" id="card-mem">
+    <h2>内存</h2>
+    <div class="gauge">
+      <div class="gauge-value big" id="mem-usage">—</div>
+      <div class="bar"><div class="fill" id="mem-bar"></div></div>
+      <div class="gauge-sub" id="mem-detail"></div>
+    </div>
+    <div class="subhead">内存模组（DDR5 SPD 直读）</div>
+    <div class="dimms" id="dimms"></div>
+  </section>
+
+  <section class="card" id="card-gpu">
+    <h2>GPU <small id="gpu-source"></small></h2>
+    <div class="hidden" id="gpu-none">未检测到 NVIDIA GPU（NVML 与 nvidia-smi 都不可用）</div>
+    <div id="gpu-body">
+      <div class="gauges two">
+        <div class="gauge">
+          <div class="gauge-label">占用率</div>
+          <div class="gauge-value" id="gpu-usage">—</div>
+          <div class="bar"><div class="fill" id="gpu-usage-bar"></div></div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">温度 / 显存结温</div>
+          <div class="gauge-value" id="gpu-temp">—</div>
+          <div class="gauge-sub" id="gpu-temp-sub"></div>
+        </div>
+      </div>
+      <div class="gauge-label mt">显存</div>
+      <div class="gauge-value" id="gpu-vram">—</div>
+      <div class="bar"><div class="fill" id="gpu-vram-bar"></div></div>
+      <div class="gauge-sub" id="gpu-vram-sub"></div>
+      <div class="kv" id="gpu-kv"></div>
+      <div class="chips" id="gpu-chips"></div>
+    </div>
+  </section>
+
+  <section class="card wide" id="card-storage">
+    <h2>存储 <small id="storage-count"></small></h2>
+    <div class="disks" id="disks"></div>
+  </section>
+
+  <section class="card wide" id="card-board">
+    <h2>主板 <small id="board-chip"></small></h2>
+    <div class="hidden" id="board-none">SuperIO 不可用（需要管理员权限，或芯片未实现解码）</div>
+    <div class="board" id="board-sensors"></div>
+  </section>
+
+  <section class="card wide" id="card-sources">
+    <h2>数据源</h2>
+    <div class="chips sources" id="sources"></div>
+    <div class="foot-note" id="sources-note"></div>
+  </section>
+
+</main>
+
+<footer>
+  <span>Rust 核心 <code>cs_core.dll</code> · C ABI · FastAPI 壳 v<span id="foot-ver">…</span></span>
+  <span id="foot-dll"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

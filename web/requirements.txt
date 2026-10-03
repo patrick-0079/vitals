@@ -1,0 +1,7 @@
+# vitals web 壳（Python 侧）依赖
+# 安装：python -m pip install -r web/requirements.txt
+#      国内镜像：python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r web/requirements.txt
+
+fastapi>=0.110
+# uvicorn[standard] 会带上 websockets —— WebSocket 推送必需
+uvicorn[standard]>=0.27
