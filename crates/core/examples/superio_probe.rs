@@ -32,6 +32,7 @@ const BASE_ADDRESS_REGISTER: u8 = 0x60;
 const DEVICE_SELECT_REGISTER: u8 = 0x07;
 const NUVOTON_HARDWARE_MONITOR_IO_SPACE_LOCK: u8 = 0x28;
 const WINBOND_NUVOTON_HARDWARE_MONITOR_LDN: u8 = 0x0B;
+#[allow(dead_code)] // 常量表留全，便于以后移植 Fintek 分支
 const FINTEK_HARDWARE_MONITOR_LDN: u8 = 0x04;
 
 /// LHM `Nct677X.cs:23-25`

@@ -21,11 +21,21 @@ pub mod amd_temp;
 pub mod gpu;
 pub mod schema;
 #[cfg(windows)]
+pub mod cpu_topology;
+#[cfg(windows)]
+pub mod nvapi;
+#[cfg(windows)]
 pub mod pawnio;
+#[cfg(windows)]
+pub mod smbus;
+#[cfg(windows)]
+pub mod spd;
 #[cfg(windows)]
 pub mod smu;
 #[cfg(windows)]
 pub mod storage;
+#[cfg(windows)]
+pub mod superio;
 #[cfg(windows)]
 pub mod wmi_temp;
 
@@ -33,8 +43,48 @@ pub mod wmi_temp;
 #[cfg(not(windows))]
 pub mod storage {
     use crate::schema::StorageMetrics;
+
     pub fn poll() -> Vec<StorageMetrics> {
         Vec::new()
+    }
+
+    /// 占位：非 Windows 没有 IOCTL_DISK_PERFORMANCE
+    #[derive(Default)]
+    pub struct PerfState;
+
+    #[derive(Clone, Copy)]
+    pub struct PerfSample {
+        pub index: u32,
+        pub code: u32,
+        pub error: u32,
+    }
+
+    impl PerfState {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn sample(&mut self) -> Vec<PerfSample> {
+            Vec::new()
+        }
+    }
+
+    pub fn merge_perf(_metrics: &mut [StorageMetrics], _samples: &[PerfSample]) -> usize {
+        0
+    }
+
+    /// 占位：非 Windows 没有 NVMe 设备计数器
+    #[derive(Default)]
+    pub struct ThroughputState;
+
+    impl ThroughputState {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn apply(&mut self, _metrics: &mut [StorageMetrics]) -> usize {
+            0
+        }
     }
 }
 
@@ -50,13 +100,50 @@ pub mod smu {
     }
 }
 
+/// 非 Windows 占位：SuperIO（LPC 硬件监控芯片）只存在于 Windows 侧的 x86 主板
+#[cfg(not(windows))]
+pub mod superio {
+    pub fn access_denied() -> bool {
+        false
+    }
+}
+
+/// 非 Windows 占位：NVAPI 只在 NVIDIA 驱动带 nvapi64.dll 的 Windows 上可用
+#[cfg(not(windows))]
+pub mod nvapi {
+    /// 占位类型：与 Windows 侧同名，供 `gpu::NvmlGpu` 持有 `Option<NvapiGpu>`
+    pub struct NvapiGpu;
+
+    impl NvapiGpu {
+        pub fn open() -> Option<NvapiGpu> {
+            None
+        }
+
+        pub fn read_thermal(&self) -> (Option<f32>, Option<f32>) {
+            (None, None)
+        }
+    }
+}
+
+/// 非 Windows 占位：SPD 直读依赖 PawnIO + PIIX4 SMBus（Windows only）
+#[cfg(not(windows))]
+pub mod spd {
+    use crate::schema::DimmMetrics;
+    pub fn poll() -> Vec<DimmMetrics> {
+        Vec::new()
+    }
+}
+
 use std::ffi::c_char;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use schema::{CpuMetrics, Info, MemoryMetrics, Metrics, SmuSensor, SourcesStatus, StorageMetrics};
+use schema::{
+    CpuCoreMetrics, CpuMetrics, DimmMetrics, Info, MemoryMetrics, Metrics, SmuSensor,
+    SourcesStatus, StorageMetrics, SuperIoMetrics,
+};
 
 /// LHM 官方签发的 PawnIO 模块（MPL-2.0，来源见 drivers/pawnio/）。
 #[cfg(windows)]
@@ -123,6 +210,48 @@ impl Monitor {
         #[cfg(not(windows))]
         let smu_pm_table_version = None;
 
+        // 主板 SuperIO（风扇/板温/电压）：LPC 端口同样要管理员权限
+        #[cfg(windows)]
+        let superio_client = {
+            let s = superio::SuperIo::open();
+            sources.superio = s.as_ref().map(|s| s.is_supported()).unwrap_or(false);
+            s
+        };
+        #[cfg(not(windows))]
+        let superio_client: Option<()> = None;
+        #[cfg(windows)]
+        let superio_chip = superio_client
+            .as_ref()
+            .map(|s| s.chip_name().to_string());
+        #[cfg(not(windows))]
+        let superio_chip: Option<String> = None;
+
+        // 内存模组 SPD（DDR5 温度/型号）：走 PIIX4 SMBus，与 CPU 温度同属提权能力。
+        // 总线句柄常驻（与 LHM 的 RAMSPDToolkitDriver 同粒度），避免每帧重载模块。
+        #[cfg(windows)]
+        let spd_bus = smbus::Piix4::open(Some(0));
+        #[cfg(not(windows))]
+        let spd_bus: Option<()> = None;
+        #[cfg(windows)]
+        let dimms_seed = spd_bus
+            .as_ref()
+            .map(spd::enumerate)
+            .unwrap_or_default();
+        #[cfg(not(windows))]
+        let dimms_seed: Vec<DimmMetrics> = Vec::new();
+        sources.spd = dimms_seed.iter().any(|d| d.source == "ddr5-spd");
+
+        // 每核 MSR（时钟/功耗）：拓扑一次拿定，基线在采样线程里维护
+        #[cfg(windows)]
+        let core_groups = if amd_temp::is_zen(id) {
+            cpu_topology::core_groups()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(windows))]
+        let core_groups: Vec<Vec<u32>> = Vec::new();
+        sources.msr_cores = pawnio.is_some() && !core_groups.is_empty();
+
         // NVML
         let nvml = gpu::NvmlGpu::open();
         sources.nvml = nvml.is_some();
@@ -149,8 +278,14 @@ impl Monitor {
         sources.wmi = wmi_ok;
 
         // 存储（NVMe SMART）：探测一次，既做数据源标记也给采样线程做种子
-        let storage_seed = storage::poll();
+        let mut storage_seed = storage::poll();
         sources.storage_smart = storage_seed.iter().any(|s| s.source == "nvme-smart");
+        // 磁盘性能计数器（活动率/吞吐）：首轮只建基线，顺带判定权限是否够
+        let mut storage_perf = storage::PerfState::new();
+        sources.storage_perf = storage_perf.sample().iter().any(|s| s.error == 0);
+        // 设备计数器差分（吞吐兜底）：同样首轮只建基线
+        let mut storage_units = storage::ThroughputState::new();
+        storage_units.apply(&mut storage_seed);
 
         let info = Info {
             version: env!("CARGO_PKG_VERSION"),
@@ -162,6 +297,7 @@ impl Monitor {
             gpu_name,
             platform: std::env::consts::OS,
             smu_pm_table_version,
+            superio_chip,
             sources: sources.clone(),
         };
 
@@ -182,8 +318,17 @@ impl Monitor {
             last_energy: None,
             wmi_cache: None,
             storage: storage_seed,
+            storage_perf,
+            storage_units,
             smu: smu_client,
             smu_sensors: Vec::new(),
+            superio: superio_client,
+            superio_metrics: None,
+            spd_bus,
+            dimms: dimms_seed,
+            core_groups,
+            core_baselines: Vec::new(),
+            core_metrics: Vec::new(),
             tick: 0,
         };
         std::thread::Builder::new()
@@ -238,13 +383,46 @@ struct Sampler {
     wmi_cache: Option<f32>,
     /// 存储指标缓存（SMART 查询较重，每 5s 刷一次）
     storage: Vec<StorageMetrics>,
+    /// 磁盘活动率/吞吐采样器（计数器每帧差分一次，很轻）
+    storage_perf: storage::PerfState,
+    /// NVMe 设备计数器差分器（IOCTL_DISK_PERFORMANCE 不可用时的吞吐兜底，5s 粒度）
+    storage_units: storage::ThroughputState,
     #[cfg(windows)]
     smu: Option<smu::SmuClient>,
     #[cfg(not(windows))]
     smu: Option<()>,
     /// SMU 传感器缓存（PM 表读一次要 update+read 两个 IOCTL，每 1s 刷一次）
     smu_sensors: Vec<SmuSensor>,
+    #[cfg(windows)]
+    superio: Option<superio::SuperIo>,
+    #[cfg(not(windows))]
+    superio: Option<()>,
+    /// SuperIO 读数缓存（每 1s 刷一次；持不到 ISA 总线锁时留上一帧）
+    superio_metrics: Option<SuperIoMetrics>,
+    /// PIIX4 SMBus 句柄（内存 SPD 用；无权限时为 None）
+    #[cfg(windows)]
+    spd_bus: Option<smbus::Piix4>,
+    #[cfg(not(windows))]
+    spd_bus: Option<()>,
+    /// 内存模组缓存（身份静态，温度每 5s 刷一次）
+    dimms: Vec<DimmMetrics>,
+    /// 物理核拓扑（物理核 → 逻辑处理器列表），启动时一次
+    core_groups: Vec<Vec<u32>>,
+    /// 每核 MSR 基线（APERF/MPERF/能耗计数器 + 时间戳）
+    core_baselines: Vec<CoreBaseline>,
+    /// 每核读数缓存
+    core_metrics: Vec<CpuCoreMetrics>,
     tick: u64,
+}
+
+/// 每核计数器的上一次采样值。APERF/MPERF/能耗都是**每核独立**的累加计数器，
+/// 差分必须与「上一次在同一个核上读到的值」配对，所以基线要按核存。
+#[derive(Clone, Copy, Default)]
+struct CoreBaseline {
+    aperf: u64,
+    mperf: u64,
+    energy: Option<u32>,
+    at: Option<Instant>,
 }
 
 fn now_ms() -> u64 {
@@ -306,7 +484,14 @@ impl Sampler {
         // 存储 SMART：每 5s（10 tick）刷一次，其余帧用缓存
         if self.tick % 10 == 1 {
             self.storage = storage::poll();
+            // 设备计数器差分（吞吐兜底）：与 SMART 同频，得到的是 5s 区间平均
+            self.storage_units.apply(&mut self.storage);
         }
+
+        // 磁盘活动率/吞吐：每帧采一次（每块盘一个 IOCTL，成本几十 µs）。
+        // 速率靠与上一帧配对，所以必须每帧都采，不能跟 SMART 一起降到 5s。
+        let perf = self.storage_perf.sample();
+        storage::merge_perf(&mut self.storage, &perf);
 
         // SMU PM 表：每 1s（2 tick）刷一次。读失败（拿不到 PCI 锁等）就留上一帧，
         // 宁缺毋脏。
@@ -318,6 +503,35 @@ impl Sampler {
                 }
             }
         }
+
+        // SuperIO（主板风扇/板温/电压）：每 2s（4 tick）刷一次 —— 28 个温度下标 + 16 路
+        // 电压 + 7 路风扇，每个寄存器要 4 次端口 I/O，比 SMU 重得多。
+        #[cfg(windows)]
+        if self.tick % 4 == 1 {
+            if let Some(s) = self.superio.as_ref() {
+                if let Some(sensors) = s.read_sensors() {
+                    self.superio_metrics = Some(SuperIoMetrics {
+                        chip: s.chip_name().to_string(),
+                        profile: s.profile_id().to_string(),
+                        sensors,
+                    });
+                }
+            }
+        }
+
+        // 内存 SPD 温度：每 5s（10 tick）刷一次。身份信息（型号/序列号）是静态的，
+        // 启动时读过一次就不再碰 EEPROM 页，避免每帧几十次 1ms 级字节读。
+        #[cfg(windows)]
+        if self.tick % 10 == 1 {
+            if let Some(bus) = self.spd_bus.as_ref() {
+                spd::refresh_temperatures(bus, &mut self.dimms);
+            }
+        }
+
+        // 每核 MSR（时钟/有效频率/功耗）：每帧都读。8 核 × 4 个 MSR 约 32 次 IOCTL，
+        // 单次 ~20µs，总开销在 1ms 量级，比 SMU/SuperIO 轻得多；读之前按核钉线程。
+        #[cfg(windows)]
+        self.sample_cores();
 
         Metrics {
             ts_ms: now_ms(),
@@ -333,6 +547,7 @@ impl Sampler {
                 core_voltage_v: smu::find(&self.smu_sensors, "VDDCR", "voltage"),
                 soc_voltage_v: smu::find(&self.smu_sensors, "VDDCR SoC", "voltage"),
                 smu: self.smu_sensors.clone(),
+                per_core: self.core_metrics.clone(),
             },
             memory: MemoryMetrics {
                 usage_pct: mem_pct,
@@ -341,6 +556,8 @@ impl Sampler {
             },
             gpu,
             storage: self.storage.clone(),
+            superio: self.superio_metrics.clone(),
+            dimms: self.dimms.clone(),
         }
     }
 
@@ -387,6 +604,118 @@ impl Sampler {
             Some(t) => (Some(t), "wmi-thermal".into(), vec![], None),
             None => (None, "none".into(), vec![], None),
         }
+    }
+
+    /// 逐核读 MSR（时钟 / 有效频率 / 功耗）。
+    ///
+    /// 三条通路的共同前提：**读之前把线程钉到目标核**（`rdmsr` 是每核寄存器）。
+    /// - 瞬时频率：`HW_PSTATE_STATUS` 的 CpuFid（Zen5: Fid[11:0]×5 MHz）
+    /// - 有效频率：APERF 增量 ÷ 窗口（APERF 只在实际执行时计数，故摊出来是平均值）
+    /// - 每核功耗：`CORE_ENERGY_STAT` 差分 × 能量单位 ÷ 时间
+    ///
+    /// 首帧只建立基线（差分需要两次采样），计数器倒挂或跳变过大时丢弃该轮并重建基线。
+    #[cfg(windows)]
+    fn sample_cores(&mut self) {
+        let Some(p) = self.pawnio.as_ref() else {
+            return;
+        };
+        if self.core_groups.is_empty() {
+            return;
+        }
+        if self.energy_unit_j.is_none() {
+            self.energy_unit_j = amd_temp::read_energy_unit_j(p);
+        }
+        let unit_j = self.energy_unit_j.unwrap_or(0.0);
+
+        if self.core_baselines.len() != self.core_groups.len() {
+            self.core_baselines = vec![CoreBaseline::default(); self.core_groups.len()];
+        }
+
+        // 与 cpu_temp 共用同一把 PCI 锁（两次取锁互不嵌套，不会自死锁）
+        let _pci = pawnio::PciBusGuard::wait(1000);
+
+        let mut out = Vec::with_capacity(self.core_groups.len());
+        for (idx, group) in self.core_groups.iter().enumerate() {
+            let thread = group[0]; // 与 LHM 一致：取该核的第一个线程
+            let Some(_aff) = cpu_topology::Affinity::pin(thread) else {
+                continue;
+            };
+            let pstate = amd_temp::read_pstate_status(p);
+            let aperf = p.read_msr(amd_temp::MSR_APERF_RO);
+            let mperf = p.read_msr(amd_temp::MSR_MPERF_RO);
+            let energy = amd_temp::read_core_energy(p);
+            let now = Instant::now();
+            // _aff 在此 drop → 恢复调度器原样
+
+            let base = self.core_baselines[idx];
+            // 瞬时频率（不依赖基线）
+            let raw_clock = match pstate {
+                Some(eax) if self.id.family >= 0x1A => amd_temp::core_clock_mhz_zen5(eax),
+                Some(eax) => amd_temp::core_clock_mhz_legacy(eax, 100.0),
+                None => 0.0,
+            };
+
+            let mut clock_mhz = raw_clock;
+            let mut effective_mhz = 0.0;
+            let mut ratio = None;
+            let mut power_w = None;
+
+            if let (Some(at), Some(a1), Some(m1)) = (base.at, aperf, mperf) {
+                let dt_s = now.duration_since(at).as_secs_f64();
+                match (
+                    amd_temp::counter_delta(a1, base.aperf),
+                    amd_temp::counter_delta(m1, base.mperf),
+                ) {
+                    (Some(da), Some(dm)) if da > 0 && dm > 0 && dt_s > 0.0 => {
+                        effective_mhz = amd_temp::effective_clock_mhz(da, dt_s * 1e6);
+                        ratio = Some((da as f64 / dm as f64) as f32);
+                        clock_mhz = amd_temp::ratio_adjusted_clock_mhz(raw_clock, da, dm);
+                    }
+                    _ => {
+                        // 计数器倒挂/跳变：本轮不给差值，只重建基线
+                        self.core_baselines[idx] = CoreBaseline {
+                            aperf: a1,
+                            mperf: m1,
+                            energy,
+                            at: Some(now),
+                        };
+                        out.push(CpuCoreMetrics {
+                            index: idx as u32,
+                            thread,
+                            clock_mhz: raw_clock as f32,
+                            effective_mhz: 0.0,
+                            power_w: None,
+                            aperf_mperf_ratio: None,
+                        });
+                        continue;
+                    }
+                }
+
+                if let (Some(e1), Some(e0)) = (energy, base.energy) {
+                    let d = e1.wrapping_sub(e0) as u64;
+                    if d < 20_000_000_000 {
+                        power_w = amd_temp::calc_core_power_w(d, unit_j, dt_s);
+                    }
+                }
+            }
+
+            self.core_baselines[idx] = CoreBaseline {
+                aperf: aperf.unwrap_or(base.aperf),
+                mperf: mperf.unwrap_or(base.mperf),
+                energy: energy.or(base.energy),
+                at: Some(now),
+            };
+
+            out.push(CpuCoreMetrics {
+                index: idx as u32,
+                thread,
+                clock_mhz: clock_mhz as f32,
+                effective_mhz: effective_mhz as f32,
+                power_w,
+                aperf_mperf_ratio: ratio,
+            });
+        }
+        self.core_metrics = out;
     }
 }
 

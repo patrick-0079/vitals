@@ -35,6 +35,9 @@ const OPEN_EXISTING: u32 = 3;
 const PCI_MUTEX_NAME: &str = r"Global\Access_PCI";
 /// `Mutexes.cs` —— LHM 用这把锁把 ISA/LPC 总线访问串行化，与它共存时同样要遵守
 const ISA_MUTEX_NAME: &str = r"Global\Access_ISABUS.HTP.Method";
+/// RAMSPDToolkit `SharedConstants.SMBusMutexName`（内核名 `\BaseNamedObjects\Access_SMBUS.HTP.Method`）
+/// —— SMBus 事务前必须持有，PawnIO 的 SmbusXxx 模块注释里也明确要求
+const SMBUS_MUTEX_NAME: &str = r"Global\Access_SMBUS.HTP.Method";
 
 const ERROR_ACCESS_DENIED: u32 = 5;
 
@@ -97,6 +100,13 @@ impl PawnIo {
 
     /// 执行模块内函数。输入 i64 数组，输出 i64 数组；失败返回 None。
     pub fn execute(&self, name: &str, input: &[i64], out_len: usize) -> Option<Vec<i64>> {
+        self.execute_hr(name, input, out_len).ok()
+    }
+
+    /// 与 [`execute`](Self::execute) 相同，但把失败时的 `GetLastError()`
+    /// （即模块返回的 NTSTATUS 映射到 Win32 的值）一并返回 —— SMBus 传输需要
+    /// 区分「总线忙」等可重试错误与「不支持」这类硬错误。
+    pub fn execute_hr(&self, name: &str, input: &[i64], out_len: usize) -> Result<Vec<i64>, u32> {
         let mut total = vec![0u8; FN_NAME_LENGTH + input.len() * 8];
         let name_bytes = name.as_bytes();
         let n = name_bytes.len().min(FN_NAME_LENGTH - 1);
@@ -119,15 +129,13 @@ impl PawnIo {
                 std::ptr::null_mut(),
             );
             if ok == 0 {
-                return None;
+                return Err(GetLastError());
             }
         }
         let n = (read as usize) / 8;
-        Some(
-            (0..n)
-                .map(|i| i64::from_le_bytes(out[i * 8..i * 8 + 8].try_into().unwrap()))
-                .collect(),
-        )
+        Ok((0..n)
+            .map(|i| i64::from_le_bytes(out[i * 8..i * 8 + 8].try_into().unwrap()))
+            .collect())
     }
 
     /// 读 SMN（System Management Network）寄存器 —— AMD 温度/电压的入口。
@@ -188,6 +196,29 @@ impl IsaBusGuard {
 }
 
 impl Drop for IsaBusGuard {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.mutex);
+            CloseHandle(self.mutex);
+        }
+    }
+}
+
+/// `Global\Access_SMBUS.HTP.Method` 互斥锁守卫（RAMSPDToolkit `WorldMutexManager.WorldSMBusMutex`）：
+/// 每一次 SMBus 事务（`ioctl_smbus_xfer`）都要持有，与 LHM 等同样读 SPD 的工具串行化。
+pub struct SmbusGuard {
+    mutex: HANDLE,
+}
+
+impl SmbusGuard {
+    pub fn wait(timeout_ms: u32) -> Option<SmbusGuard> {
+        Some(SmbusGuard {
+            mutex: wait_named_mutex(SMBUS_MUTEX_NAME, timeout_ms)?,
+        })
+    }
+}
+
+impl Drop for SmbusGuard {
     fn drop(&mut self) {
         unsafe {
             ReleaseMutex(self.mutex);

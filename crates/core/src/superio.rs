@@ -15,23 +15,33 @@
 //!
 //! 探测结论：id=0xD8 rev=0x06 → NCT6701D，配置端口 0x2E，运行时基址 0x290（非 EC 空间，
 //! 走 bank/register 协议），`io_lock` 已是 0 → 无需解锁。运行时全 bank 转储与
-//! LHM 的寄存器表逐项对得上：
+//! LHM 的寄存器表逐项对得上，解出的读数（提权实跑）：
 //!
-//! | 传感器 | 寄存器 | 实测 | 交叉验证 |
+//! | 传感器 | 寄存器 | 实测 | 备注 |
 //! |---|---|---|---|
-//! | Vcore | 0x480 | 1.384 V | SMU PM 表 VDDCR 1.376 V（独立通路，偏差 0.6%） |
-//! | +12V | 0x484 | 12.08 V | 标称 12 V |
-//! | +5V | 0x481 | 5.02 V | 标称 5 V |
-//! | +3.3V | 0x483 | 3.39 V | 标称 3.3 V |
-//! | Motherboard | 0x490(SYSTIN) | 35 °C | — |
-//! | T-Sensor | 0x495(AUXTIN3) | 26 °C | — |
-//! | VRM | 0x491(CPUTIN) | 36 °C | — |
-//! | CPU | 0x4F4(PECI_0_CAL) | 45 °C | AMD Tctl（SMN 0x59800） |
+//! | +12V | 0x484 | 12.08 V | 标称值 ✓ |
+//! | +5V | 0x481 | 5.02 V | 标称值 ✓ |
+//! | +3.3V | 0x483 | 3.33 V | 标称值 ✓ |
+//! | +3V Standby | 0x487 | 3.39 V | 标称值 ✓ |
+//! | 1.8V Standby | 0x48C | 1.82 V | 标称值 ✓ |
+//! | CPU Fan | 0x4B2 | 1032 RPM | 随负载变化 ✓ |
+//! | Chassis Fan #1 | 0x4B0 | 802 RPM | 随负载变化 ✓ |
+//! | Motherboard | 0x490 (SYSTIN) | 34 °C | — |
+//! | VRM | 0x491 (CPUTIN) | 35 °C | — |
+//! | T-Sensor | 0x495 (AUXTIN3) | 26 °C | — |
+//! | CPU (PECI) | 0x4F4 (PECI_0_CAL) | 39 °C | 比 AMD Tctl 低 13~17 °C，非同一传感器 |
+//! | Vcore (unverified) | 0x480 | 1.10~1.34 V | ⚠ 见下 |
 //!
-//! 注意 LHM 的 `TUF_GAMING_B850M_PLUS_II` 档把 "CPU" 放在下标 **22**（`PECI_1_CAL` @0x4F5），
-//! 但本机该寄存器恒为 0x00 → LHM 的 `DecodeNct6701Temperature` 判为「无传感器」。
-//! 本机可用的是下标 **21**（`PECI_0_CAL` @0x4F4）。我们的板型（…-PLUS WIFI7）LHM 尚未收录，
-//! 因此温度命名以**实测对拍**为准，profile 里逐项标注来源。
+//! ⚠ **0x480 不是 CPU core 电压**（这条推翻了"首次探针 1.384 V ↔ VDDCR 1.377 V 吻合"
+//! 的巧合结论）：把 `--jsonl --watch` 的 7 帧逐帧对拍后，SMU PM 表 VDDCR 稳定在
+//! 1.3803~1.3971 V，而同期的 0x480 在 1.3360 V（帧 1-4）与 1.0960 V（帧 5-7）之间
+//! 跳变 —— 两条通路互不相关。LHM 的 `TUF_GAMING_B850M_PLUS_II` 档把 0x480 命名为
+//! "Vcore"，但本机板型（`…-PLUS WIFI7`）LHM 并未收录，该命名在本板不成立，故名字里
+//! 保留 `(unverified)` 标记；CPU 核心电压请以 SMU 的 VDDCR 为准。
+//!
+//! 同理 LHM 的 `TUF_GAMING_B850M_PLUS_II` 档把 "CPU" 放在下标 **22**（`PECI_1_CAL`
+//! @0x4F5），本机该寄存器恒为 0x00 → `DecodeNct6701Temperature` 判为「无传感器」，
+//! 可用的是下标 **21**（`PECI_0_CAL` @0x4F4）。
 
 #![cfg(windows)]
 
@@ -199,8 +209,17 @@ struct BoardProfile {
 }
 
 /// ASUS AM5（B850M/X870 一档）—— 数值取自 LHM `TUF_GAMING_B850M_PLUS_II`（SuperIOHardware.cs:5616-5651）
+///
+/// ⚠ 本机（`TUF GAMING B850M-PLUS WIFI7`，LHM 未收录的板型）实测标定：
+/// - 下标 0 的 LHM 名字是 "Vcore"，但实测它**不跟随** CPU 的 core 电压：
+///   同一时间窗内 SMU PM 表 VDDCR 稳定在 1.3803~1.3971 V，而该寄存器在
+///   1.3360 V 与 1.0960 V 之间跳变（7 帧实测）。两条通路互相独立，说明本板
+///   0x480 接的不是 CPU core rail → 名字标为 "Vcore (unverified)"，CPU 核心电压
+///   请以 SMU 的 `VOLT Core`（VDDCR）为准。
+/// - 下标 1/3/4/7/12 落在 +5V/+3.3V/+12V/+3V Standby/1.8V Standby 的标称值上，
+///   这几项可以认为名义正确。
 const ASUS_AM5_VOLTAGES: [VoltageDef; 16] = [
-    VoltageDef { name: "Vcore", index: 0, ri: 0.0, rf: 1.0, vf: 0.0, hidden: false },
+    VoltageDef { name: "Vcore (unverified)", index: 0, ri: 0.0, rf: 1.0, vf: 0.0, hidden: false },
     VoltageDef { name: "+5V", index: 1, ri: 4.02, rf: 1.0, vf: 0.0, hidden: false },
     VoltageDef { name: "AVSB", index: 2, ri: 34.0, rf: 34.0, vf: 0.0, hidden: false },
     VoltageDef { name: "+3.3V", index: 3, ri: 34.0, rf: 34.0, vf: 0.0, hidden: false },
@@ -219,9 +238,12 @@ const ASUS_AM5_VOLTAGES: [VoltageDef; 16] = [
 ];
 
 /// 温度命名：前三条来自 LHM `TUF_GAMING_B850M_PLUS_II`；"VRM"@1 来自 `ROG_STRIX_B850_A`；
-/// "CPU"@21 是本机实测对拍后改的（LHM 的 @22 在本机恒为哨兵值 0x00）。
+/// "CPU (PECI)"@21 是本机实测对拍后改的 —— LHM 的 @22（`PECI_1_CAL`）在本机恒为哨兵
+/// 0x00，可用的是 @21（`PECI_0_CAL` @0x4F4）。名字里带 PECI 是因为它**不是** AMD 的
+/// Tctl（SMN 0x59800）：本机实测两者差 13~17 °C（面板 Tctl 52 °C 时这项读 39 °C），
+/// CPU 温度应以 CPU 段的 Tctl 为准。
 const ASUS_AM5_TEMPERATURES: [NamedSensor; 4] = [
-    NamedSensor { name: "CPU", index: 21 },
+    NamedSensor { name: "CPU (PECI)", index: 21 },
     NamedSensor { name: "VRM", index: 1 },
     NamedSensor { name: "Motherboard", index: 2 },
     NamedSensor { name: "T-Sensor", index: 6 },
@@ -324,9 +346,12 @@ pub fn apply_divider(value: f32, ri: f32, rf: f32, vf: f32) -> f32 {
 /// `Nct677X.cs:821-862` —— NCT6701D 的温度源复用解析。
 ///
 /// 与其它 NCT67xx 不同，NCT6701D 的温度**按 source 归属**而不是按下标：
-/// 带 `source_register` 的条目先读出真实 source，再把该寄存器读到的温度写进
-/// **所有** source 相同的下标，并用掩码保证「先到的赢」；source 未被任何条目
-/// 声明时整条跳过。
+/// 带 `source_register` 的条目先读出真实 source，再把该 source 对应寄存器读到的
+/// 温度写进**所有「配置 Source 等于该 source」的下标**（不是写进读 source 寄存器的
+/// 那个下标），并用掩码保证「先到的赢」；source 未被任何条目声明时整条跳过。
+///
+/// 本机实例：下标 11 的 `source_register`(0xC2A) 读出 AUXTIN4，于是 `0x678` 的值
+/// 被写进下标 7（唯一声明 AUXTIN4 的下标），下标 11 自己保持空。
 pub fn resolve_temperatures(read: &mut dyn FnMut(u16) -> u8) -> Vec<Option<f32>> {
     let n = NCT6701D_TEMP_SOURCES.len();
     let mut out: Vec<Option<f32>> = vec![None; n];
@@ -403,10 +428,10 @@ pub fn identify_winbond(id: u8, revision: u8) -> Option<(&'static str, bool)> {
         (0xD4, 0x2A, _) => ("Nuvoton NCT6796DR / NCT5585D", false),
         (0xD4, 0x51, _) => ("Nuvoton NCT6797D", false),
         (0xD4, 0x2B, _) => ("Nuvoton NCT6798D", false),
-        (0xD4, 0x40) | (0xD4, 0x41) => ("Nuvoton NCT6686D", true),
-        (0xD5, 0x92) => ("Nuvoton NCT6687D / NCT6687DR", true),
-        (0xD8, 0x02) => ("Nuvoton NCT6799D / NCT6796DS", false),
-        (0xD8, 0x06) => ("Nuvoton NCT6701D", false),
+        (0xD4, 0x40, _) | (0xD4, 0x41, _) => ("Nuvoton NCT6686D", true),
+        (0xD5, 0x92, _) => ("Nuvoton NCT6687D / NCT6687DR", true),
+        (0xD8, 0x02, _) => ("Nuvoton NCT6799D / NCT6796DS", false),
+        (0xD8, 0x06, _) => ("Nuvoton NCT6701D", false),
         _ => return None,
     };
     Some((name, ec))
@@ -474,7 +499,7 @@ impl SuperIo {
             ACCESS_DENIED.store(true, std::sync::atomic::Ordering::Relaxed);
             return None;
         };
-        let (chip_name, reg_port, base) = detect(&pawn)?;
+        let (chip_name, _reg_port, base) = detect(&pawn)?;
         let supported = chip_name == "Nuvoton NCT6701D";
         Some(SuperIo {
             pawn,
@@ -603,11 +628,6 @@ impl SuperIo {
 fn detect(pawn: &PawnIo) -> Option<(&'static str, u16, u16)> {
     struct Lpc<'a>(&'a PawnIo);
     impl Lpc<'_> {
-        fn inb(&self, port: u16) -> u8 {
-            self.0
-                .execute("ioctl_pio_inb", &[port as i64], 1)
-                .map_or(0xFF, |v| v[0] as u8)
-        }
         fn outb(&self, port: u16, value: u8) {
             self.0
                 .execute("ioctl_pio_outb", &[port as i64, value as i64], 0);
@@ -792,10 +812,13 @@ mod tests {
         assert_eq!(temps[4], Some(19.0));
         assert_eq!(temps[5], Some(18.0));
         assert_eq!(temps[6], Some(26.0));
-        // AUXTIN4(7) 的 source_register(0x621) 指向 SYSTIN，已被下标 2 占用 → 下标 7 保持空
-        // 但下标 11 的 source_register(0xC2A) 指向 AUXTIN4，会把 0x678 的值写进下标 7 与 11
+        // 易错点（已按 Nct677X.cs:847-860 逐行核对）：值写回的目标是
+        // **配置 Source 等于该 source 的下标**，不是「读 source 寄存器的那个下标」。
+        // 下标 7 配置的是 AUXTIN4，它的 srcReg(0x621)=SYSTIN 已被下标 2 占用 → 下标 7 自己不取值；
+        // 但下标 11 的 srcReg(0xC2A)=AUXTIN4 未被占用，于是 0x678 的 24°C 被写进**下标 7**
+        // （唯一把 AUXTIN4 声明为配置 Source 的下标），下标 11 反而保持空。
         assert_eq!(temps[7], Some(24.0));
-        assert_eq!(temps[11], Some(24.0));
+        assert_eq!(temps[11], None);
         assert_eq!(temps[22], None, "0x4F5 = 0x00 是哨兵");
         assert_eq!(temps[0], None, "下标 0 的 source 解析成 PECI_0_CAL，值只写给下标 21");
         assert_eq!(temps[27], Some(30.0));
